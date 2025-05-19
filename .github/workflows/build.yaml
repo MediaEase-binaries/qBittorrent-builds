@@ -1,0 +1,280 @@
+name: Build qBittorrent
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'qBittorrent version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '4.6.7'
+          - '5.0.3'
+          - '5.0.4'
+          - '5.0.5'
+          - '5.1.0'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      max-parallel: 8
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      PACKAGE_NAME: qbittorrent-nox-${{ matrix.stability }}
+      PACKAGE_VERSION: ${{ matrix.version }}
+      PACKAGE_STABILITY: ${{ matrix.stability }}
+      BINARY_URL: ${{ matrix.binary_url }}
+      DEB_PACKAGE_NAME: ${{ matrix.deb_package_name }}
+      INSTALL_BASE: ${{ matrix.install_base }}
+      LIBTORRENT_VERSION: ${{ matrix.libtorrent_version }}
+      CODENAME: ${{ matrix.distro }}
+
+    steps:
+      - name: Install basic dependencies
+        run: |
+          upx="upx-ucl"
+          if [ "${{ matrix.os }}" = "debian-12" ]; then
+            echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list
+            upx="upx-ucl/bookworm-backports"
+          fi
+          apt-get update
+          apt-get install -y curl wget jq dpkg-dev git $upx util-linux debconf-utils build-essential checkinstall pkg-config
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Create package directory structure
+        run: |
+          mkdir -p "${{ env.INSTALL_BASE }}/usr/bin"
+          mkdir -p "${{ env.INSTALL_BASE }}/DEBIAN"
+
+      - name: Download qBittorrent binary
+        run: |
+          echo "Downloading binary from ${{ env.BINARY_URL }}"
+          curl -L "${{ env.BINARY_URL }}" -o "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox"
+          RELEASE_URL="https://api.github.com/repos/userdocs/qbittorrent-nox-static/releases/tags/release-${{ env.PACKAGE_VERSION }}_v${{ env.LIBTORRENT_VERSION }}"
+          COMPONENTS=$(curl -s -H "Accept: application/vnd.github.v3+json" "$RELEASE_URL" \
+            | jq -r .body \
+            | sed -n '/| Components/,/| *zlib-ng/p' \
+            | sed '1,2d;$d')
+          echo "$COMPONENTS" > components.txt
+          if [ -f "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox" ]; then
+            chmod +x "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox"
+            if file "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox" | grep -q "ELF.*executable"; then
+              strip --strip-unneeded "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox"
+              if command -v upx >/dev/null 2>&1; then
+                upx --best --lzma "${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox"
+              fi
+            else
+              echo "Warning: File is not an ELF executable, skipping strip and upx"
+            fi
+          else
+            echo "Error: Binary file not found at ${{ env.INSTALL_BASE }}/usr/bin/qbittorrent-nox"
+            exit 1
+          fi
+
+      - name: Setup control file
+        run: |
+          cp tools/packages/qbittorrent/control "${{ env.INSTALL_BASE }}/DEBIAN/control"
+          sed -i "s/@PACKAGE_NAME@/${{ env.PACKAGE_NAME }}/" "${{ env.INSTALL_BASE }}/DEBIAN/control"
+          sed -i "s/@ARCHITECTURE@/amd64/" "${{ env.INSTALL_BASE }}/DEBIAN/control"
+          sed -i "s/@VERSION@/${{ env.PACKAGE_VERSION }}-1build1/" "${{ env.INSTALL_BASE }}/DEBIAN/control"
+          sed -i "s/@STABILITY@/${{ env.PACKAGE_STABILITY }}/" "${{ env.INSTALL_BASE }}/DEBIAN/control"
+          sed -i "s/@MAINTAINER@/${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" "${{ env.INSTALL_BASE }}/DEBIAN/control"
+
+      - name: Building package and metadata files
+        run: |
+          mkdir -p artifacts
+          cd artifacts
+          PACKAGE_NAME=$(echo "${{ env.DEB_PACKAGE_NAME }}" | sed 's/qbittorrent-nox/qbittorrent-nox-${{ matrix.stability }}/')
+          dpkg-deb --build -Zxz -z9 -Sextreme --root-owner-group "${{ env.INSTALL_BASE }}" "${PACKAGE_NAME}"
+          components_json="["
+          while IFS='|' read -r _ component version _; do
+            comp=$(echo "$component" | xargs)
+            ver=$(echo "$version" | xargs)
+            if [ -n "$comp" ] && [ -n "$ver" ]; then
+              components_json="${components_json}{\"name\":\"$comp\",\"version\":\"$ver\"},"
+            fi
+          done < ../components.txt
+          components_json="${components_json%,}]"
+          chmod +x ../tools/generate_metadata.sh
+          ../tools/generate_metadata.sh \
+            --category "qbittorrent" \
+            --tag "${{ env.PACKAGE_STABILITY }}" \
+            --version "${{ env.PACKAGE_VERSION }}" \
+            --os "${{ env.CODENAME }}" \
+            --extra "components=${components_json}" \
+            "${PACKAGE_NAME}"
+
+      - name: Upload as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/*
+          retention-days: 2
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['4.6.7', '5.0.1', '5.0.2', '5.0.3', '5.0.4', '5.0.5', '5.1.0']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: qbittorrent-nox-${{ matrix.version }}*
+      
+      - name: Prepare release assets
+        id: prepare-release-assets
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "qbittorrent*${{ matrix.version }}*.deb" -o \
+              -name "qbittorrent*${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          {
+            echo "## Available Packages"
+            echo
+            declare -A lt_versions
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                lt_ver=$(basename "$f" | grep -oP 'lt_\K[0-9.]+(?=-1build1)' || echo "unknown")
+                lt_versions["$lt_ver"]=1
+              fi
+            done
+            IFS=$'\n' sorted_versions=($(printf "%s\n" "${!lt_versions[@]}" | sort -V))
+            unset IFS
+            for lt_ver in "${sorted_versions[@]}"; do
+              echo "### Packages with libtorrent ${lt_ver}"
+              echo
+              echo "| Package | OS | Stability |"
+              echo "| ------- | -- | --------- |"
+              for f in release_assets/*.deb; do
+                if [ -f "$f" ] && basename "$f" | grep -q "lt_${lt_ver}-1build1"; then
+                  pkg=$(basename "$f")
+                  json_file="${pkg%.deb}.json"
+                  if [ -f "release_assets/$json_file" ]; then
+                    os=$(jq -r '.os' "release_assets/$json_file")
+                    stability=$(jq -r '.tag' "release_assets/$json_file")
+                    echo "| $pkg | $os | $stability |"
+                  fi
+                fi
+              done
+              echo
+              echo "#### Components"
+              echo
+              echo "| Component | Version |"
+              echo "| --------- | ------- |"
+              for f in release_assets/*.deb; do
+                if [ -f "$f" ] && basename "$f" | grep -q "lt_${lt_ver}-1build1"; then
+                  json_file="release_assets/$(basename "$f" .deb).json"
+                  if [ -f "$json_file" ]; then
+                    components=$(jq -r '.components' "$json_file")
+                    echo "$components" | jq -r '.[] | "| \(.name) | \(.version) |"'
+                    break
+                  fi
+                fi
+              done
+              echo
+            done
+          } > "$PACKAGES_TABLE"
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          rm -rf "$TEMP_DIR"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: qBittorrent ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            # qBittorrent v${{ matrix.version }}
+
+            Pre-built qBittorrent packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled qBittorrent-nox (headless server version)
+            - Multiple distribution support
+            - Multiple libtorrent versions support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Optimized for MediaEase applications
+
+            ${{ steps.prepare-release-assets.outputs.packages_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            The package will be installed to `/opt/MediaEase/binaries/installed/qbittorrent_${{ matrix.version }}_lt_${{ matrix.libtorrent_version }}`
+
+            ## 📝 License
+
+            qBittorrent is distributed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
