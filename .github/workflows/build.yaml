@@ -187,7 +187,7 @@ jobs:
             "${PACKAGE_NAME}"
 
       - name: Upload as Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: artifacts/*
@@ -241,7 +241,7 @@ jobs:
 
       - name: Create Release
         if: steps.prepare-release-assets.outputs.skip_release != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ matrix.version }}
           name: qBittorrent ${{ matrix.version }}
