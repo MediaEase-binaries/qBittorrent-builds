@@ -214,7 +214,7 @@ jobs:
           path: tools
 
       - name: Download artifacts for this version
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: downloaded_artifacts
           pattern: krate-qbittorrent*${{ matrix.version }}*
